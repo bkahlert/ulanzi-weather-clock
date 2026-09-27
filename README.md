@@ -1,11 +1,6 @@
-# Ulanzi Weather Clock
+# Ulanzi Weather Clock [![License](https://img.shields.io/github/license/bkahlert/ulanzi-weather-clock?color=29ABE2&label=License)](LICENSE) [![AWTRIX NG](https://img.shields.io/badge/AWTRIX%20NG-1.1.2%2B-2E7D32)](https://github.com/Blueforcer/awtrix-ng) [![AWTRIX Hub](https://img.shields.io/badge/AWTRIX%20Hub-flow-F4A261)](https://awtrix.de/flow/wQPSUfXDCHbe) [![Buy Me A Coffee](https://img.shields.io/static/v1?label=&message=%E2%98%95%20Buy%20Me%20A%20Coffee&color=FFDD00)](https://www.buymeacoffee.com/bkahlert)
 
 A clock for the [Ulanzi TC001](https://www.ulanzi.com/products/ulanzi-pixel-smart-clock-2882) and other 32×8 [AWTRIX NG](https://github.com/Blueforcer/awtrix-ng) panels: time, calendar and an animated weather scene in two designs, written in AWTRIX NG's Berry scripting. No MQTT, no home automation, no cloud account; the panel fetches the weather itself.
-
-[![License](https://img.shields.io/github/license/bkahlert/ulanzi-weather-clock?color=29ABE2&label=License)](LICENSE)
-[![AWTRIX NG](https://img.shields.io/badge/AWTRIX%20NG-1.1.2%2B-2E7D32)](https://github.com/Blueforcer/awtrix-ng)
-[![AWTRIX Hub](https://img.shields.io/badge/AWTRIX%20Hub-flow-F4A261)](https://awtrix.de/flow/wQPSUfXDCHbe)
-[![Buy Me A Coffee](https://img.shields.io/static/v1?label=&message=%E2%98%95%20Buy%20Me%20A%20Coffee&color=FFDD00)](https://www.buymeacoffee.com/bkahlert)
 
 ---
 
