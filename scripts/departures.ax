@@ -1,0 +1,114 @@
+# @name    Departures
+# @desc    Next departures at a BVG stop, scrolled once per turn, coloured by product
+# @version 1.0
+# @config  stop  text   "BVG stop id"              default="900100003" maxlen=16 help="S+U Alexanderplatz (Berlin); find a stop id at v6.bvg.transport.rest/locations?query=<name>"
+# @config  count number "Departures to show"       default=3 min=1 max=5
+# @config  walk  number "Minutes to the stop"      default=0 min=0 max=30 unit=min help="Departures sooner than this are hidden"
+# @config  every number "Refresh"                  default=60 min=30 max=300 unit=s
+# @config  sbahn bool   "S-Bahn"                   default=true
+# @config  ubahn bool   "U-Bahn"                   default=true
+# @config  tram  bool   "Tram"                     default=true
+# @config  bus   bool   "Bus"                      default=true
+
+import string
+
+class Departures
+  var pieces, ticks, busy, fetched
+
+  def init()
+    self.pieces = []
+    self.ticks = 0
+    self.busy = false
+    self.fetched = -1
+  end
+
+  def url()
+    var f = def (k) return store.get(k) ? "true" : "false" end
+    var u = "https://v6.bvg.transport.rest/stops/" + store.get("stop") + "/departures"
+      + "?duration=60&results=" + str(store.get("count") + 2)
+      + "&remarks=false&linesOfStops=false&stopovers=false&pretty=false"
+      + "&suburban=" + f("sbahn") + "&subway=" + f("ubahn")
+      + "&tram=" + f("tram") + "&bus=" + f("bus")
+    # Ask for departures from the moment one could reach the stop; filtering afterwards would
+    # empty a small answer at a busy stop.
+    if store.get("walk") > 0 && epoch_ms() > 0
+      u += "&when=" + str(int(epoch_ms() / 1000) + store.get("walk") * 60)
+    end
+    return u
+  end
+
+  def loop()
+    if self.ticks <= 0 && !self.busy
+      self.ticks = store.get("every")
+      self.busy = true
+      http.get(self.url(), / b, st -> self.on_body(b, st), {"cap": 12000})
+    end
+    self.ticks -= 1
+  end
+
+  # The body is cut into one block per "tripId" and each block searched on its own; a cancelled
+  # departure ("when":null) drops out. The pieces for scroll_text() are built here, once per
+  # fetch, never in draw().
+  def on_body(body, status)
+    self.busy = false
+    if body == nil || string.find(body, "\"departures\"") < 0 return end
+    var rows = []
+    var start = string.find(body, "\"tripId\"")
+    while start >= 0 && size(rows) < store.get("count")
+      var stop = string.find(body, "\"tripId\"", start + 8)
+      var block = stop < 0 ? body[start ..] : body[start .. stop - 1]
+      var row = self.parse(block)
+      if row != nil rows.push(row) end
+      start = stop
+    end
+    var pieces = []
+    for r : rows
+      pieces.push([r[0] + " ", self.color(r[3])])
+      pieces.push([r[1] + " " + (r[2] == 0 ? "now" : str(r[2]) + "'") + "   ", 0xFFFFFF])
+    end
+    self.pieces = pieces
+    self.fetched = now_ms()
+  end
+
+  def parse(block)
+    var when = re.search("\"when\":\"[^T]*T(\\d\\d):(\\d\\d)", block)
+    var dir = re.search("\"direction\":\"([^\"]*)\"", block)
+    var line = re.search("\"line\":{.*?\"name\":\"([^\"]+)\"", block)
+    var prod = re.search("\"product\":\"([a-z]+)\"", block)
+    if when == nil || dir == nil || line == nil return nil end
+    var mins = num(when[1]) * 60 + num(when[2]) - (hour() * 60 + minute())
+    if mins < 0 mins += 1440 end
+    if mins < store.get("walk") return nil end
+    return [line[1], self.short(dir[1]), mins, prod == nil ? "" : prod[1]]
+  end
+
+  # "S+U Hauptbahnhof (Berlin)" → "Hauptbahnhof", "S Blankenfelde (TF) Bhf" → "Blankenfelde".
+  def short(s)
+    for prefix : ["S+U ", "S ", "U "]
+      if size(s) > size(prefix) && s[0 .. size(prefix) - 1] == prefix s = s[size(prefix) ..] end
+    end
+    var cut = string.find(s, " (")
+    if cut > 0 s = s[0 .. cut - 1] end
+    if size(s) > 4 && s[size(s) - 4 ..] == " Bhf" s = s[0 .. size(s) - 5] end
+    return s
+  end
+
+  def color(product)
+    if product == "suburban" return 0x00C060 end
+    if product == "subway"   return 0x2080FF end
+    if product == "tram"     return 0xFF3030 end
+    if product == "bus"      return 0xC040C0 end
+    return 0xFFFFFF
+  end
+
+  def draw()
+    clear()
+    if size(self.pieces) == 0
+      text(1, 6, self.fetched < 0 ? "..." : "no departures", 0x666666)
+      return
+    end
+    scroll_text(self.pieces, 0xFFFFFF, {"repeat": 1})
+  end
+end
+
+return Departures()

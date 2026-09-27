@@ -1,0 +1,40 @@
+#!/usr/bin/env python3
+"""Builds dist/ulanzi-weather-clock-<version>.zip: a backup the clock's Restore accepts.
+
+The archive holds manifest.json and SCRIPTS/<name>.ax for every script `apply` would
+install - the app, its modules, not the ones apps.json lists as disabled - in the same
+comment-free form `apply` uploads. Restoring it writes those files next to whatever the clock
+already has and touches nothing else; the scripts load on the next boot.
+
+    ./bundle
+    # web UI: System → Restore backup → dist/ulanzi-weather-clock-<version>.zip, then reboot
+    # or: curl -u "$ULANZI_USER:$ULANZI_PASSWORD" -F "backup=@dist/ulanzi-weather-clock-<version>.zip" http://<clock>/api/v1/restore
+"""
+import importlib.machinery
+import importlib.util
+import json
+import re
+import sys
+import zipfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+spec = importlib.util.spec_from_loader("apply", importlib.machinery.SourceFileLoader("apply", str(HERE / "apply")))
+apply = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(apply)
+
+def main() -> int:
+    disabled = set(json.loads((HERE / "apps.json").read_text())["disabled"])
+    scripts = sorted(p for p in (HERE / "scripts").glob("*.ax") if p.stem not in disabled)
+    version = re.search(r"^# @version\s+(\S+)", (HERE / "scripts/clock.ax").read_text(), re.M).group(1)
+    out = HERE / "dist" / f"ulanzi-weather-clock-{version}.zip"
+    out.parent.mkdir(exist_ok=True)
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_STORED) as z:
+        z.writestr("manifest.json", json.dumps({"app": "awtrix-ng", "backupFormat": 1, "source": f"ulanzi-weather-clock {version}"}))
+        for p in scripts:
+            z.writestr(f"SCRIPTS/{p.name}", apply.wire_form(p.read_text()))
+    print(f"{out.relative_to(HERE)}: {len(scripts)} scripts ({', '.join(p.stem for p in scripts)}), {out.stat().st_size} bytes")
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,61 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.11"
+# ///
+"""Run the clock's offline tests: the modules and clock.ax under a stubbed script API in a standalone Berry.
+
+Berry is the interpreter the firmware embeds (berry-lang/berry); `berry` on PATH is used, else it is
+cloned and built once into ~/.cache/awtrix-berry. Each test in this directory is concatenated after
+harness.be and the app (clock.ax without its trailing `return Clock()`), with every module copied next
+to it as <name>.be, since a standalone Berry resolves `import x` to ./x.be. A test fails by raising.
+"""
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+SCRIPTS = HERE.parent / "scripts"
+CACHE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "awtrix-berry"
+
+
+def berry() -> Path:
+    found = shutil.which("berry")
+    if found:
+        return Path(found)
+    binary = CACHE / "berry" / "berry"
+    if not binary.exists():
+        print(f"building berry into {CACHE}", flush=True)
+        CACHE.mkdir(parents=True, exist_ok=True)
+        if not (CACHE / "berry" / "Makefile").exists():
+            subprocess.run(["git", "clone", "--quiet", "--depth", "1", "https://github.com/berry-lang/berry.git", str(CACHE / "berry")], check=True)
+        subprocess.run(["make", "-j4"], cwd=CACHE / "berry", check=True, stdout=subprocess.DEVNULL)
+    return binary
+
+
+def main() -> int:
+    interpreter = berry()
+    tests = sorted(p for p in HERE.glob("*.be") if p.name != "harness.be")
+    if sys.argv[1:]:
+        tests = [t for t in tests if t.stem in sys.argv[1:]]
+    app = SCRIPTS.joinpath("clock.ax").read_text().rsplit("return Clock()", 1)[0] + "var app = Clock()\n"
+    failed = []
+    with tempfile.TemporaryDirectory() as tmp:
+        for module in list(SCRIPTS.glob("*.ax")) + list(SCRIPTS.glob("sprites/*.ax")):
+            if module.stem not in ("clock", "departures"):
+                shutil.copy(module, Path(tmp) / f"{module.stem}.be")
+        for test in tests:
+            combined = Path(tmp) / f"{test.stem}_combined.be"
+            combined.write_text(HERE.joinpath("harness.be").read_text() + app + test.read_text())
+            print(f"== {test.stem}", flush=True)
+            result = subprocess.run([str(interpreter), combined.name], cwd=tmp)
+            if result.returncode != 0:
+                failed.append(test.stem)
+    print("failed:" if failed else "all tests passed", ", ".join(failed))
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

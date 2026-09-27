@@ -1,0 +1,4 @@
+{
+  "order": ["clock"],
+  "disabled": ["Time", "Temperature", "Humidity", "Battery", "Date", "departures"]
+}

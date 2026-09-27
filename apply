@@ -1,0 +1,674 @@
+#!/usr/bin/env python3
+"""Push the desired state in this directory to the Ulanzi clock (AWTRIX NG HTTP API v1).
+
+Steps, in order: system config, display settings, icons, scripts, rotation.
+Every step reads the device first and writes only what differs, so a run
+against an already-configured clock changes nothing. Script `# @config`
+values are the one exception: the web UI owns them, a run only reports
+where they differ from the header, and `--reset-config` writes them back.
+
+Usage:
+    ./apply                        everything, against ULANZI_IP from the repo .env
+    ./apply --dry-run              report differences, write nothing
+    ./apply --only icons,scripts   subset of: system settings icons scripts rotation
+    ./apply --reset-config         also put script settings back to the header defaults
+    ./apply --host 192.168.4.1 --wifi
+                                   first boot: talk to the setup AP and include the
+                                   Wi-Fi credentials from .env in the system config
+
+.env keys: ULANZI_IP ULANZI_USER ULANZI_PASSWORD WIFI_SSID WIFI_PASSWORD
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import mimetypes
+import re
+import sys
+import time
+import urllib.error
+import http.client
+import urllib.request
+import uuid
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+REPO_ROOT = HERE
+STEPS = ["system", "settings", "icons", "scripts", "rotation"]
+SECRET_KEYS = {"authUser", "authPass", "wifiSsid", "wifiPass"}
+# System keys the firmware only picks up after a restart.
+REBOOT_KEYS = {"hostname", "mqttEnabled", "haDiscovery", "authEnabled", "wifiSsid", "wifiPass", "netStatic"}
+
+TTY = sys.stdout.isatty()
+
+
+def paint(code: str, icon: str) -> str:
+    return f"\033[{code}m{icon}\033[0m" if TTY else icon
+
+
+ICONS = {
+    "ok": paint("32", "✔"),
+    "err": paint("31", "✘"),
+    "item": paint("90", "▪"),
+    "task": paint("33", "⚙"),
+    "info": paint("37", "ℹ"),
+    "warn": paint("1;33", "!"),
+}
+
+
+def log(kind: str, msg: str) -> None:
+    print(f"{ICONS[kind]} {msg}")
+
+
+def load_env(path: Path) -> dict[str, str]:
+    env: dict[str, str] = {}
+    if not path.exists():
+        return env
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        env[key.strip()] = value.strip().strip("'\"")
+    return env
+
+
+class Device:
+    def __init__(self, host: str, user: str | None, password: str | None):
+        self.base = f"http://{host}"
+        self.auth = None
+        if user and password:
+            token = base64.b64encode(f"{user}:{password}".encode()).decode()
+            self.auth = f"Basic {token}"
+
+    def call(self, method: str, path: str, body: bytes | None = None,
+             content_type: str | None = None, timeout: int = 20):
+        req = urllib.request.Request(self.base + path, data=body, method=method)
+        if content_type:
+            req.add_header("Content-Type", content_type)
+        if self.auth:
+            req.add_header("Authorization", self.auth)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.status, parse(resp.read(), resp.headers.get("Content-Type", ""))
+        except urllib.error.HTTPError as e:
+            return e.code, parse(e.read(), e.headers.get("Content-Type", ""))
+        except (urllib.error.URLError, OSError, TimeoutError) as e:
+            return 0, str(e)
+        except http.client.HTTPException as e:
+            # a warm, fragmented heap makes the clock answer a source GET with the length header
+            # and no body (IncompleteRead); status 0 tells the caller the answer is unusable
+            return 0, f"incomplete response: {e}"
+
+    def get(self, path: str):
+        return self.call("GET", path)
+
+    def fetch_raw(self, path: str) -> bytes | None:
+        req = urllib.request.Request(self.base + path)
+        if self.auth:
+            req.add_header("Authorization", self.auth)
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                return resp.read()
+        except urllib.error.HTTPError:
+            return None
+
+    def send_json(self, method: str, path: str, payload) -> tuple[int, object]:
+        return self.call(method, path, json.dumps(payload).encode(), "application/json")
+
+    def upload(self, path: str, filename: str, data: bytes) -> tuple[int, object]:
+        boundary = uuid.uuid4().hex
+        mime = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        body = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+            f"Content-Type: {mime}\r\n\r\n"
+        ).encode() + data + f"\r\n--{boundary}--\r\n".encode()
+        return self.call("POST", path, body, f"multipart/form-data; boundary={boundary}", timeout=60)
+
+    def wait_rebooted(self, asked: float, seconds: int = 120) -> bool:
+        """True once the clock answers with an uptime shorter than the time since the reboot was asked for.
+
+        The restart begins a few seconds after the request and the API keeps answering until then,
+        so merely being reachable does not mean the clock has rebooted.
+        """
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            try:
+                status, body = self.get("/api/v1/device")
+                if status == 200 and isinstance(body, dict) and body.get("uptimeSeconds", float("inf")) < time.time() - asked:
+                    return True
+            except (urllib.error.URLError, OSError, TimeoutError):
+                pass
+            time.sleep(2)
+        return False
+
+
+def parse(raw: bytes, content_type: str):
+    if "json" in content_type:
+        try:
+            return json.loads(raw.decode())
+        except ValueError:
+            pass
+    return raw.decode(errors="replace")
+
+
+def version_tuple(v) -> tuple:
+    """"1.1.2" -> (1, 1, 2); anything that is not plain dotted numbers is (), which compares as unknown."""
+    parts = str(v).split(".")
+    return tuple(int(part) for part in parts) if all(part.isdigit() for part in parts) else ()
+
+
+def describe_error(status: int, body) -> str:
+    if status == 0:
+        return f"no answer: {body}"
+    if isinstance(body, dict) and "error" in body:
+        err = body["error"]
+        if isinstance(err, dict):
+            field = f" ({err['field']})" if err.get("field") else ""
+            return f"HTTP {status} {err.get('code')}: {err.get('message')}{field}"
+        return f"HTTP {status}: {err}"
+    return f"HTTP {status}: {str(body)[:200]}"
+
+
+def step_system(dev: Device, env: dict[str, str], args) -> Device | None:
+    """Returns the device handle to use for the remaining steps, or None on failure."""
+    desired = json.loads((HERE / "system.json").read_text())
+    if desired.get("authEnabled"):
+        if not (env.get("ULANZI_USER") and env.get("ULANZI_PASSWORD")):
+            log("err", "system.json enables auth but ULANZI_USER / ULANZI_PASSWORD are missing in .env")
+            return None
+        desired["authUser"] = env["ULANZI_USER"]
+        desired["authPass"] = env["ULANZI_PASSWORD"]
+    if args.wifi:
+        if not (env.get("WIFI_SSID") and env.get("WIFI_PASSWORD") and env.get("ULANZI_IP")):
+            log("err", "--wifi needs WIFI_SSID, WIFI_PASSWORD and ULANZI_IP in .env")
+            return None
+        desired["wifiSsid"] = env["WIFI_SSID"]
+        desired["wifiPass"] = env["WIFI_PASSWORD"]
+
+    status, current = dev.get("/api/v1/system")
+    if status != 200:
+        log("err", f"cannot read system config: {describe_error(status, current)}")
+        return None
+
+    changed = {k: v for k, v in desired.items() if k not in SECRET_KEYS and current.get(k) != v}
+    if args.wifi:
+        changed["wifiSsid"] = desired["wifiSsid"]
+    for key in sorted(changed):
+        shown = "…" if key in SECRET_KEYS else json.dumps(changed[key])
+        log("item", f"system.{key}: {json.dumps(current.get(key))} → {shown}")
+    if not changed:
+        log("ok", "system config up to date")
+        return dev
+    if args.dry_run:
+        return dev
+
+    payload = {**changed}
+    if desired.get("authEnabled"):
+        payload["authUser"], payload["authPass"] = desired["authUser"], desired["authPass"]
+    if args.wifi:
+        payload["wifiPass"] = desired["wifiPass"]
+    status, body = dev.send_json("PUT", "/api/v1/system", payload)
+    if status != 200:
+        log("err", f"system config rejected: {describe_error(status, body)}")
+        return None
+    log("ok", f"system config written ({len(changed)} change{'s' if len(changed) != 1 else ''})")
+
+    if not (REBOOT_KEYS & changed.keys()):
+        return dev
+    # Auth may have just been switched on; the same credentials are valid either way.
+    after = Device(args.host if not args.wifi else env["ULANZI_IP"], env.get("ULANZI_USER"), env.get("ULANZI_PASSWORD"))
+    log("task", f"rebooting so {', '.join(sorted(REBOOT_KEYS & changed.keys()))} take effect")
+    asked = time.time()
+    dev.send_json("POST", "/api/v1/device/reboot", {})
+    if args.wifi:
+        log("info", f"waiting for the clock to join {env['WIFI_SSID']} and answer at {env['ULANZI_IP']}")
+    if not after.wait_rebooted(asked):
+        log("err", f"clock did not come back at {after.base} within 120 s")
+        return None
+    log("ok", f"clock back online at {after.base}")
+    return after
+
+
+def step_settings(dev: Device, args) -> bool:
+    desired = json.loads((HERE / "settings.json").read_text())
+    status, current = dev.get("/api/v1/settings")
+    if status != 200:
+        log("err", f"cannot read settings: {describe_error(status, current)}")
+        return False
+    patch = {}
+    for key, value in desired.items():
+        if isinstance(value, dict) and isinstance(current.get(key), dict):
+            merged = {**current[key], **value}
+            if merged != current[key]:
+                patch[key] = merged
+        elif current.get(key) != value:
+            patch[key] = value
+    for key in sorted(patch):
+        log("item", f"settings.{key}: {json.dumps(current.get(key))} → {json.dumps(patch[key])}")
+    if not patch:
+        log("ok", "settings up to date")
+        return True
+    if args.dry_run:
+        return True
+    status, body = dev.send_json("PATCH", "/api/v1/settings", patch)
+    if status != 200:
+        log("err", f"settings rejected: {describe_error(status, body)}")
+        return False
+    log("ok", f"settings written ({len(patch)} change{'s' if len(patch) != 1 else ''})")
+    return True
+
+
+def step_icons(dev: Device, args) -> bool:
+    local = sorted(p for p in (HERE / "icons").iterdir() if p.suffix.lower() in {".gif", ".jpg", ".jpeg"})
+    status, listing = dev.get("/api/v1/files?dir=/ICONS")
+    if status != 200:
+        log("err", f"cannot list /ICONS: {describe_error(status, listing)}")
+        return False
+    remote = {f["name"]: f["size"] for f in listing.get("files", [])}
+    ok = True
+    pending = 0
+    for path in local:
+        data = path.read_bytes()
+        if remote.get(path.name) == len(data) and dev.fetch_raw(f"/ICONS/{path.name}") == data:
+            continue
+        pending += 1
+        log("item", f"icon {path.name}: {'update' if path.name in remote else 'upload'} ({len(data)} bytes)")
+        if args.dry_run:
+            continue
+        status, body = dev.upload("/api/v1/files?dir=/ICONS", path.name, data)
+        if status != 200:
+            log("err", f"icon {path.name} rejected: {describe_error(status, body)}")
+            ok = False
+    stale = sorted(set(remote) - {p.name for p in local})
+    for name in stale:
+        pending += 1
+        log("item", f"icon {name}: delete (not in icons/)")
+        if args.dry_run:
+            continue
+        status, body = dev.call("DELETE", f"/api/v1/files?path=/ICONS/{name}")
+        if status != 200:
+            log("err", f"icon {name} not deleted: {describe_error(status, body)}")
+            ok = False
+    if pending == 0:
+        log("ok", f"icons up to date ({len(local)} on the clock)")
+    elif ok and not args.dry_run:
+        log("ok", f"icons synced ({len(local)} on the clock)")
+    return ok
+
+
+CONFIG_LINE = re.compile(r'^#\s*@config\s+(?P<key>\S+)\s+(?P<type>\S+)\s+(?:"[^"]*"\s*)?(?P<opts>.*)$')
+CONFIG_DEFAULT = re.compile(r'default=(?:"(?P<quoted>[^"]*)"|(?P<bare>\S+))')
+
+
+def header_defaults(source: str) -> dict:
+    """Returns {key: default} from the script's `# @config` lines, typed like the config API."""
+    defaults = {}
+    for line in source.splitlines():
+        if not line.startswith("#"):
+            break
+        m = CONFIG_LINE.match(line)
+        if not m:
+            continue
+        d = CONFIG_DEFAULT.search(m["opts"])
+        if not d:
+            continue
+        raw = d["quoted"] if d["quoted"] is not None else d["bare"]
+        kind = m["type"]
+        if kind == "bool":
+            value = raw.lower() == "true"
+        elif kind in ("number", "slider"):
+            value = float(raw) if "." in raw else int(raw)
+        else:
+            value = raw
+        defaults[m["key"]] = value
+    return defaults
+
+
+def enforce_config(dev: Device, name: str, source: str, args) -> bool:
+    """The web UI owns `# @config` values; the header only seeds a fresh install.
+
+    Values that differ from the header are reported and kept. `--reset-config` writes the
+    header defaults back, which is also how a changed default in the repo reaches the clock.
+    A `<name>.json` in the config directory (`--config`) pins values - a location, a stop -
+    that belong to one clock rather than to the script: those are written whenever they differ.
+    """
+    defaults = header_defaults(source)
+    pin_file = args.config / f"{name}.json" if args.config else None
+    pinned = json.loads(pin_file.read_text()) if pin_file and pin_file.is_file() else {}
+    if not defaults and not pinned:
+        return True
+    status, body = dev.get(f"/api/v1/apps/{name}/config")
+    if status != 200:
+        log("err", f"cannot read {name} config: {describe_error(status, body)}")
+        return False
+    current = {f["key"]: f.get("value") for f in body.get("fields", [])}
+    unknown = sorted(k for k in pinned if k not in current)
+    if unknown:
+        log("warn", f"{name}: {pin_file} names settings the script does not declare: {', '.join(unknown)}")
+    patch = {k: v for k, v in pinned.items() if k in current and current[k] != v}
+    for key in sorted(patch):
+        log("item", f"{name}.{key}: {json.dumps(current[key])} → {json.dumps(patch[key])} ({pin_file.name})")
+    header = {k: v for k, v in defaults.items() if k in current and k not in pinned and current[k] != v}
+    for key in sorted(header):
+        if args.reset_config:
+            log("item", f"{name}.{key}: {json.dumps(current[key])} → {json.dumps(header[key])}")
+        else:
+            log("info", f"{name}.{key} = {json.dumps(current[key])} set in the web UI (header: {json.dumps(header[key])}), kept")
+    if args.reset_config:
+        patch.update(header)
+    if not patch or args.dry_run:
+        return True
+    status, body = dev.send_json("PATCH", f"/api/v1/apps/{name}/config", patch)
+    if status != 200:
+        log("err", f"{name} config rejected: {describe_error(status, body)}")
+        return False
+    if isinstance(body, dict) and body.get("error"):
+        log("err", f"{name} restarted with an error: {body['error']}")
+        return False
+    log("ok", f"{name} config set ({len(patch)} change{'s' if len(patch) != 1 else ''})")
+    return True
+
+
+def out_of_memory(status: int, body) -> bool:
+    text = json.dumps(body).lower() if not isinstance(body, str) else body.lower()
+    return status == 507 or "out of memory" in text or "fragmented" in text
+
+
+def wire_form(source: str) -> str:
+    """The script as uploaded: header lines, then code without comments, blank lines or indentation.
+
+    A new version compiles while the old one still runs, and the compile guard wants the whole
+    source in one free block of the script heap, about 20 KB on this clock. The repo copy stays
+    readable; the clock gets a copy a quarter smaller that compiles to the same thing.
+    """
+    lines = []
+    for line in source.splitlines():
+        text = line.strip()
+        if text.startswith("# @"):
+            lines.append(text)
+            continue
+        text = uncommented(text).rstrip()
+        if text:
+            lines.append(text)
+    return "\n".join(lines) + "\n"
+
+
+def uncommented(line: str) -> str:
+    """The line up to its first `#` outside a string literal."""
+    quote = None
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if quote:
+            if ch == "\\":
+                i += 1
+            elif ch == quote:
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+        elif ch == "#":
+            return line[:i]
+        i += 1
+    return line
+
+
+def is_module(source: str) -> bool:
+    """Whether the header - the leading comment lines, as header_defaults reads them - declares a module."""
+    for line in source.splitlines():
+        if not line.startswith("#"):
+            return False
+        if line.startswith("# @module"):
+            return True
+    return False
+
+
+IMPORT_LINE = re.compile(r"^\s*import\s+([A-Za-z_]\w*)", re.M)
+
+
+def install_order(paths):
+    """Modules before the scripts that import them, apps last: a script compiles in one go only when
+    everything it imports is already on the clock (a module arriving later reinstalls its importers,
+    which works but reports the first attempt as broken)."""
+    sources = {}
+    for path in paths:
+        if path.stem in sources:
+            sys.exit(f"two scripts would install under the same name: {path.stem}")
+        sources[path.stem] = path.read_text()
+    names = set(sources)
+    depth = {}
+
+    def rank(name, seen=()):
+        if name in depth:
+            return depth[name]
+        if name in seen:
+            sys.exit(f"scripts import each other in a circle: {' -> '.join(seen + (name,))}")
+        deps = [d for d in IMPORT_LINE.findall(sources[name]) if d in names]
+        depth[name] = 1 + max([rank(d, seen + (name,)) for d in deps], default=0)
+        return depth[name]
+
+    return sorted(paths, key=lambda path: (not is_module(sources[path.stem]), rank(path.stem), path.name))
+
+
+def install_script(dev: Device, name: str, wire: str):
+    """One upload of a script's wire form, with the two ways a warm clock has failed it covered.
+
+    The compile wants the whole source in one free block of the script heap, next to the version
+    that runs. On a clock that has been running for a while the block has shrunk and the upload
+    ends in HTTP 507, or in a panic when the block is only a little larger than the source; on a
+    fresh boot it goes through. step_scripts reboots before installing, this is the safety net.
+    Removing the old version first does not help: its share of the heap is not given back until
+    the next boot.
+    """
+    status, body = dev.call("PUT", f"/api/v1/apps/script/{name}", wire.encode(), "text/plain", timeout=60)
+    if status == 0:
+        # Taken as a panic during the compile, the one way an upload has gone silent so far. A clock
+        # that was merely slow makes this wait run out and report a failure; the next run repairs it.
+        log("warn", f"script {name}: the clock stopped answering during the upload ({body}); waiting for it to come back")
+        if not dev.wait_rebooted(time.time() - 60):
+            return 0, "clock did not come back online within 120 s"
+    elif not out_of_memory(status, body):
+        return status, body
+    else:
+        log("warn", f"script {name}: not enough free memory to compile ({describe_error(status, body)})")
+    # The running version is what fills the heap, and a reboot brings it right back. So stage a stub
+    # under the same name - the header lines, which keep the settings, and an empty app - reboot with
+    # the stub running, and upload into the room it leaves.
+    log("task", f"script {name}: staging a stub, rebooting, then uploading into the freed heap")
+    header = "\n".join(line for line in wire.splitlines() if line.startswith("# @"))
+    # a module stub must return a value the firmware accepts as one: `return nil` is rejected as no return
+    stub = header + ("\nreturn {}\n" if is_module(wire) else "\nclass Stub def draw() clear() end end\nreturn Stub()\n")
+    status, body = dev.call("PUT", f"/api/v1/apps/script/{name}", stub.encode(), "text/plain", timeout=60)
+    if status != 200:
+        return status, body
+    if not reboot(dev):
+        return 0, "clock did not come back online within 120 s after the reboot"
+    status, body = dev.call("PUT", f"/api/v1/apps/script/{name}", wire.encode(), "text/plain", timeout=60)
+    if status == 0:
+        # seen once: the upload into the freed heap got no answer, and the stub stayed in place with the
+        # app broken on the panel until the next run; one more try once the clock answers again
+        log("warn", f"script {name}: no answer to the upload after the reboot ({body}); trying once more")
+        if not dev.wait_rebooted(time.time() - 60):
+            return 0, "clock did not come back online within 120 s after the upload"
+        status, body = dev.call("PUT", f"/api/v1/apps/script/{name}", wire.encode(), "text/plain", timeout=60)
+    return status, body
+
+
+def reboot(dev: Device) -> bool:
+    asked = time.time()
+    dev.send_json("POST", "/api/v1/device/reboot", {})
+    return dev.wait_rebooted(asked)
+
+
+def step_scripts(dev: Device, args) -> bool:
+    ok = True
+    status, apps = dev.get("/api/v1/apps")
+    if status != 200:
+        log("err", f"cannot list apps: {describe_error(status, apps)}")
+        return False
+    broken = {a["name"]: a["error"] for a in apps if a.get("error")}
+    remote = {a["name"] for a in apps if a.get("origin") in ("script", "module")}
+    # A script app named in apps.json's `disabled` stays in the repo but not on the clock: switched
+    # off it would still hold its share of the Berry heap (departures: 6.4 KB), which the wipe
+    # sprites need. Moving it to `order` installs it again.
+    parked = {n for n in json.loads((HERE / "apps.json").read_text())["disabled"] if (HERE / "scripts" / f"{n}.ax").exists()}
+    local = install_order([p for p in sorted((HERE / "scripts").rglob("*.ax")) if p.stem not in parked])
+    for name in sorted(remote - {path.stem for path in local}):
+        log("item", f"script {name}: remove, " + ("switched off in apps.json" if name in parked else "not in scripts/"))
+        if args.dry_run:
+            continue
+        status, body = dev.call("DELETE", f"/api/v1/apps/{name}")
+        if status == 200:
+            log("ok", f"script {name} removed")
+        else:
+            log("err", f"script {name} not removed: {describe_error(status, body)}")
+            ok = False
+    todo = []
+    for path in local:
+        name = path.stem
+        source = path.read_text()
+        wire = wire_form(source)
+        status, current = dev.get(f"/api/v1/apps/script/{name}")
+        if status == 200 and current == wire and name not in broken:
+            log("ok", f"script {name} up to date")
+            ok &= enforce_config(dev, name, source, args)
+            continue
+        if status == 0:
+            log("item", f"script {name}: installed source not readable ({current}); reinstall after the reboot")
+            todo.append((name, source, wire))
+            continue
+        if name in broken:
+            log("item", f"script {name}: reinstall, stuck on {broken[name].get('message', broken[name])}")
+        else:
+            log("item", f"script {name}: {'update' if status == 200 else 'install'} ({len(wire.encode())} B on the wire, {len(source.encode())} B in the repo)")
+        todo.append((name, source, wire))
+    if not todo or args.dry_run:
+        return ok
+    # Once for all scripts, whatever their size: a second rule for small ones is not worth a second failure mode.
+    log("task", "rebooting for a fresh heap before compiling")
+    if not reboot(dev):
+        log("err", "clock did not come back online within 120 s after the reboot")
+        return False
+    # A warm heap cuts source reads short, and a cut read looks like a difference; with the heap
+    # fresh, read once more and install only what really differs or is broken.
+    for name, source, wire in list(todo):
+        status, current = dev.get(f"/api/v1/apps/script/{name}")
+        if status == 200 and current == wire and name not in broken:
+            log("ok", f"script {name} up to date after all (the first read was cut short)")
+            todo.remove((name, source, wire))
+            ok &= enforce_config(dev, name, source, args)
+    for name, source, wire in todo:
+        status, body = install_script(dev, name, wire)
+        if status != 200:
+            log("err", f"script {name} rejected: {describe_error(status, body)}")
+            ok = False
+            continue
+        # A script that fails to compile still installs with 200; the compiler speaks through `error`.
+        err = body.get("error") if isinstance(body, dict) else None
+        if err:
+            where = f" (line {err['line']})" if isinstance(err, dict) and err.get("line") else ""
+            msg = err.get("message") if isinstance(err, dict) else err
+            log("err", f"script {name} does not compile{where}: {msg}")
+            ok = False
+            continue
+        log("ok", f"script {name} installed")
+        ok &= enforce_config(dev, name, source, args)
+    return ok
+
+
+def step_rotation(dev: Device, args) -> bool:
+    desired = json.loads((HERE / "apps.json").read_text())
+    status, apps = dev.get("/api/v1/apps")
+    if status != 200:
+        log("err", f"cannot list apps: {describe_error(status, apps)}")
+        return False
+    current_order = [a["name"] for a in sorted((a for a in apps if a.get("inLoop")), key=lambda a: a.get("slot") or 0)]
+    # modules never rotate and are listed disabled; they are not apps to switch on or off
+    current_disabled = sorted(a["name"] for a in apps if not a.get("enabled") and a.get("origin") != "module")
+    # a switched-off script app is not on the clock at all (see step_scripts), so it cannot be disabled there
+    present = {a["name"] for a in apps}
+    desired = {"order": desired["order"], "disabled": [n for n in desired["disabled"] if n in present]}
+    if current_order == desired["order"] and current_disabled == sorted(desired["disabled"]):
+        log("ok", f"rotation up to date: {' → '.join(current_order)}")
+        return True
+    log("item", f"rotation: {' → '.join(current_order) or '(empty)'} → {' → '.join(desired['order'])}")
+    log("item", f"disabled: {current_disabled} → {sorted(desired['disabled'])}")
+    if args.dry_run:
+        return True
+    status, body = dev.send_json("PUT", "/api/v1/apps/order", desired)
+    if status != 200:
+        log("err", f"rotation rejected: {describe_error(status, body)}")
+        return False
+    status, apps = dev.get("/api/v1/apps")
+    in_loop = {a["name"] for a in apps if a.get("inLoop")}
+    missing = [n for n in desired["order"] if n not in in_loop]
+    if missing:
+        log("warn", f"named in order but not rotating: {', '.join(missing)}")
+    log("ok", f"rotation set: {' → '.join(desired['order'])}")
+    return not missing
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--host", help="clock address (default: ULANZI_IP from .env)")
+    parser.add_argument("--only", help="comma-separated subset of steps: " + " ".join(STEPS))
+    parser.add_argument("--dry-run", action="store_true", help="report differences, write nothing")
+    parser.add_argument("--reset-config", action="store_true", help="put every script's # @config values back to the header defaults")
+    parser.add_argument("--wifi", action="store_true", help="include WIFI_SSID/WIFI_PASSWORD from .env (first boot)")
+    parser.add_argument("--env", type=Path, default=REPO_ROOT / ".env", help="path to the .env file")
+    parser.add_argument("--config", type=Path, default=REPO_ROOT / "config", help="directory of <app>.json files whose settings are enforced on the clock (default: ./config)")
+    args = parser.parse_args()
+
+    env = load_env(args.env)
+    args.host = args.host or env.get("ULANZI_IP")
+    if not args.host:
+        log("err", "no clock address: pass --host or set ULANZI_IP in .env")
+        return 1
+    steps = args.only.split(",") if args.only else STEPS
+    unknown = [s for s in steps if s not in STEPS]
+    if unknown:
+        log("err", f"unknown step(s): {', '.join(unknown)}")
+        return 1
+
+    dev = Device(args.host, env.get("ULANZI_USER"), env.get("ULANZI_PASSWORD"))
+    status, version = dev.get("/api/v1/version")
+    if status == 0:
+        log("err", f"{dev.base} unreachable: {version}")
+        return 1
+    if status == 401:
+        log("err", "clock rejected the credentials from .env")
+        return 1
+    if status != 200:
+        log("err", f"unexpected answer from {dev.base}: {describe_error(status, version)}")
+        return 1
+    fw = version.get("version") if isinstance(version, dict) else version
+    log("info", f"{dev.base} runs AWTRIX NG {fw}{' (dry run)' if args.dry_run else ''}")
+    if version_tuple(fw) and version_tuple(fw) < (1, 1, 2):
+        log("warn", f"the hold on the middle button needs AWTRIX NG 1.1.2 or later; on {fw} the button only switches the design and the demo cannot start (upgrade: docs/operations.md)")
+
+    failed = False
+    if "system" in steps:
+        log("task", "system config")
+        dev = step_system(dev, env, args)
+        if dev is None:
+            return 1
+    if "settings" in steps:
+        log("task", "settings")
+        failed |= not step_settings(dev, args)
+    if "icons" in steps:
+        log("task", "icons")
+        failed |= not step_icons(dev, args)
+    if "scripts" in steps:
+        log("task", "scripts")
+        failed |= not step_scripts(dev, args)
+    if "rotation" in steps:
+        log("task", "rotation")
+        failed |= not step_rotation(dev, args)
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

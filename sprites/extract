@@ -1,0 +1,316 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["pillow"]
+# ///
+"""The wipe sprites of ../scripts/clock.ax, one script module ../scripts/sprites.ax: four cut from Hub
+GIFs in this directory, five drawn here.
+
+Berry scripts draw icons 8x8 only and draw GIF black as black, so the wipes carry their
+sprites as pixel strings instead: one character per pixel, '.' transparent, a small palette
+per sprite. They live in one `# @module` script returning {"cast": name -> entry, "roster":
+names}, so the clock's source holds code only: the firmware compiles a script's whole source
+in one contiguous heap block and recompiles the app on every settings save, while a module
+compiles once at boot with the heap empty. One module rather than one per sprite because the
+clock's apps listing (and with it the web UI) crashed the device at 21 scripts. Run
+`sprites/extract` to print the plan, `sprites/extract --write` to write the module and the
+options of the clock's `toWeather` / `toTime` lines.
+
+mario-luigi.gif is a 32x8 scene: the pair runs right over 48 frames at one pixel per 90 ms,
+pauses, then runs back. Frames 18-33 have both fully on screen; anchored at Mario's front
+edge they repeat every six frames. yoshi.gif is a 32x8 scene too: Yoshi walks right over
+frames 0-20 at 330 ms, then turns; anchored at his front edge those frames hold five poses
+(the tail swings, an eye blinks), taken in the order they first appear.
+
+sonicrun.gif and lemming.gif are 8x8 Hub GIFs taken whole at their own timing: Sonic running
+(the GIF's blank flash frame dropped, the two near-black blues of his outline cut), a Lemming
+walking.
+
+The drawn sprites are rows of palette letters. chase: Blinky one pixel behind Pac-Man, whose
+mouth - a wedge cut from the 8x8 disc, half-angle 0, 24 and 45 degrees - opens onto the page
+he leaves; one frame per pixel moved, so he chomps every four pixels and the ghost's skirt
+shifts every pixel. invader: the Space Invaders squid in its two arcade poses, eyes an opaque
+dark grey so the pages do not shine through them. beam: no character, a white line with a
+trail of two translucent columns fading behind it. metroid: the green dome with its red nuclei,
+fangs wiggling. kitt: the Knight Rider scanner as a rainbow column with a trail of
+three columns behind it that fade out - the trail is translucent, drawn over the page arriving
+behind the beam.
+
+A palette value is a colour, 0xRRGGBB, or a translucent colour with its opacity in 60ths in
+the top byte, 0xAARRGGBB; the compositor blends those over the arriving page.
+
+The Berry heap is the budget (see the README): all sprites but kitt and the beam share one
+palette, so a colour costs one map slot however many sprites use it; a sprite's frames are
+one string, indexed by frame; the opacities and the frame timing (in 10 ms) are bytes, not
+lists of integers.
+"""
+import re
+import sys
+from collections import Counter
+from pathlib import Path
+
+from PIL import Image, ImageSequence
+
+HERE = Path(__file__).resolve().parent
+SCRIPT = HERE.parent / "scripts" / "clock.ax"
+MODULE = HERE.parent / "scripts" / "sprites.ax"
+ALPHA = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+LETTERS = ALPHA[:52]  # digits mark transparent pixels' classes
+SAME = 60  # |dR|+|dG|+|dB| below which two GIF colours are one LED colour (the GIFs are dithered)
+BLACK = (0, 0, 0)
+
+
+# ---- from the GIFs ----
+def frames(name):
+    return [f.convert("RGB") for f in ImageSequence.Iterator(Image.open(HERE / name))]
+
+
+def window(frame, x0, w):
+    px = frame.load()
+    return [px[x0 + x, y] if 0 <= x0 + x < frame.size[0] else BLACK for y in range(8) for x in range(w)]
+
+
+def quantise(windows):
+    count = Counter(c for win in windows for c in win if c != BLACK)
+    pal = []
+    for c, _ in count.most_common():
+        if all(dist(c, q) > SAME for q in pal):
+            pal.append(c)
+    nearest = lambda c: min(range(len(pal)), key=lambda i: dist(c, pal[i]))
+    strs = ["".join("." if c == BLACK else ALPHA[nearest(c)] for c in win) for win in windows]
+    return {ALPHA[i]: (r << 16) | (g << 8) | b for i, (r, g, b) in enumerate(pal)}, strs
+
+
+def dist(a, b):
+    return sum(abs(x - y) for x, y in zip(a, b))
+
+
+def front(frame):
+    px = frame.load()
+    return max(x for y in range(8) for x in range(frame.size[0]) if px[x, y] != BLACK) + 1
+
+
+def mario():
+    ml = frames("mario-luigi.gif")
+    wins = [window(ml[i], front(ml[i]) - 16, 16) for i in range(18, 24)]  # one run cycle: poses A B C A D E
+    return 16, *quantise(wins)
+
+
+def gif_sprite(name, w=8, x0=0, take=None, stretch=False, dark=0, cut=()):
+    """Every frame of an 8-row Hub GIF as a sprite at the GIF's own timing - or only the frames `take` names, at
+    their own durations or (`stretch`) spread evenly over the GIF's whole cycle; blank frames dropped, repeats
+    merged. Pixels whose brightest channel is below `dark`, and pixels of the colours in `cut`, count as transparent,
+    like black: dithered GIFs fringe a figure with near-black pixels that would otherwise stand as an opaque dark rim."""
+    fr = [(f.convert("RGB"), f.info.get("duration", 100)) for f in ImageSequence.Iterator(Image.open(HERE / name))]
+    if take is not None:
+        total = sum(d for _, d in fr)
+        fr = [(fr[i][0], total // len(take) // 10 * 10 if stretch else fr[i][1]) for i in take]
+    keep = [([BLACK if max(c) < dark or c in cut else c for c in window(f, x0, w)], d) for f, d in fr]
+    keep = [(win, d) for win, d in keep if any(c != BLACK for c in win)]
+    pal, strs = quantise([win for win, _ in keep])
+    poses, timing = [], []
+    for s, (_, d) in zip(strs, keep):
+        if poses and poses[-1] == s:
+            timing[-1] += d
+        else:
+            poses.append(s)
+            timing.append(d)
+    return (w, pal, poses), timing
+
+
+def yoshi():
+    walk = frames("yoshi.gif")[:21]
+    pal, strs = quantise([window(f, front(f) - 8, 8) for f in walk])
+    poses = []
+    for s in strs:
+        if s not in poses:
+            poses.append(s)
+    return 8, pal, poses
+
+
+# ---- drawn ----
+def disc(x, y):
+    return (x + 0.5 - 4) ** 2 + (y + 0.5 - 4) ** 2 <= 16
+
+
+def pacman(mouth):
+    """The 8x8 disc facing right; `mouth` is the tangent of the wedge's half-angle, None keeps it shut."""
+    rows = []
+    for y in range(8):
+        r = ""
+        for x in range(8):
+            dx, dy = x + 0.5 - 4, y + 0.5 - 4
+            r += "Y" if disc(x, y) and not (mouth is not None and dx > 0 and abs(dy) <= dx * mouth) else "."
+        rows.append(r)
+    return rows
+
+
+GHOST = ["..RRRR..", ".RRRRRR.", "RWWRRWWR", "RWBRRWBR", "RRRRRRRR", "RRRRRRRR", "RRRRRRRR", "RR.RR.RR"]
+GHOST_STEP = GHOST[:-1] + [".RR.RR.R"]
+
+
+def chase():
+    pal = {"Y": 0xFFE000, "R": 0xFF0000, "W": 0xFFFFFF, "B": 0x2020FF}
+    poses = zip([GHOST, GHOST_STEP, GHOST, GHOST_STEP], [pacman(None), pacman(0.45), pacman(1.0), pacman(0.45)])
+    return 17, pal, ["".join(g + "." + p for g, p in zip(ghost, pac)) for ghost, pac in poses]
+
+
+INVADER = ["...GG...", "..GGGG..", ".GGGGGG.", "GGEGGEGG", "GGGGGGGG", "..G..G..", ".G.GG.G.", "G.G..G.G"]
+INVADER_STEP = INVADER[:5] + [".G.GG.G.", "G......G", ".G....G."]
+
+
+def invader():
+    return 8, {"G": 0x40FF60, "E": 0x202020}, ["".join(INVADER), "".join(INVADER_STEP)]
+
+
+def beam():
+    """A white column with two translucent white columns fading behind it, over the page it reveals."""
+    return 3, {"a": (15 << 24) | 0xFFFFFF, "b": (30 << 24) | 0xFFFFFF, "W": 0xFFFFFF}, ["abW" * 8]
+
+
+METROID = ["..dddd..", ".dGGGGd.", "dGrGGrGd", "dGGrrGGd", "dGGGGGGd", ".dddddd.", ".f.ff.f.", ".f....f."]
+METROID_STEP = METROID[:6] + ["..f..f..", ".f.ff.f."]
+
+
+def metroid():
+    return 8, {"d": 0x30A040, "G": 0x60F070, "r": 0xFF3030, "f": 0xE8D0A0}, ["".join(METROID), "".join(METROID_STEP)]
+
+
+# the scanner's hues, top to bottom, as the Hub icon knightriderrainbow paints its bright column
+HUES = [0xAC00F6, 0x0014F6, 0x00F6F6, 0x00F69C, 0x31F600, 0xF6F600, 0xF68500, 0xF60000]
+
+
+def kitt():
+    """One frame, 4x8: a column of the hues at full opacity, three columns of trail at 45, 30, 15 behind it."""
+    pal, rows = {}, []
+    for r, hue in enumerate(HUES):
+        row = ""
+        for c, a in enumerate((15, 30, 45, 60)):
+            letter = ALPHA[r * 4 + c]
+            pal[letter] = hue if a == 60 else (a << 24) | hue
+            row += letter
+        rows.append(row)
+    return 4, pal, ["".join(rows)]
+
+
+# ---- the Berry side ----
+def classes(s, w):
+    """The frame with each transparent pixel replaced by its class digit, and the classes' opacities in 60ths.
+
+    Transparent pixels form clusters (4-neighbour). The clusters touching the sprite's left edge show the
+    arriving page (class 0, 60/60), those touching its right edge the leaving page (last class, 0/60), and
+    the clusters in between show the arriving page dimmed, evenly from left to right: one cluster 30/60,
+    two clusters 40 and 20. A cluster touching both edges means the sprite does not separate the pages.
+    """
+    h = 8
+    seen, clusters = set(), []
+    for start in range(w * h):
+        if s[start] != "." or start in seen:
+            continue
+        stack, cells = [start], []
+        while stack:
+            i = stack.pop()
+            if i in seen or s[i] != ".":
+                continue
+            seen.add(i)
+            cells.append(i)
+            x, y = i % w, i // w
+            stack += [ny * w + nx for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)) if 0 <= nx < w and 0 <= ny < h]
+        xs = [i % w for i in cells]
+        clusters.append((min(xs), min(xs) == 0, max(xs) == w - 1, cells))
+    if any(left and right for _, left, right, _ in clusters):
+        sys.exit(f"a frame's transparent pixels connect its left and right edge; a wipe sprite must cut the panel in every row:\n"
+                 + "\n".join(s[r * w:(r + 1) * w] for r in range(h)))
+    mids = sorted((c for c in clusters if not c[1] and not c[2]), key=lambda c: c[0])
+    n = len(mids)
+    if n > 8:
+        sys.exit(f"a frame has {n} clusters between its edges; the class is one digit per pixel, so at most 8 fit")
+    alphas = [60] + [round(60 * (n - k) / (n + 1)) for k in range(n)] + [0]
+    out = list(s)
+    for minx, left, right, cells in clusters:
+        digit = "0" if left else str(n + 1) if right else str(mids.index((minx, left, right, cells)) + 1)
+        for i in cells:
+            out[i] = digit
+    return "".join(out), alphas
+
+
+def relettered(pal, strs, shared):
+    """The frames with this sprite's letters replaced by the shared palette's, which grows as needed."""
+    swap = {}
+    for letter, colour in pal.items():
+        if colour not in shared:
+            if len(shared) >= len(LETTERS):
+                sys.exit(f"the shared palette needs more than {len(LETTERS)} colours; merge some (SAME) or give a sprite its own")
+            shared[colour] = LETTERS[len(shared)]
+        swap[letter] = shared[colour]
+    return ["".join(swap.get(ch, ch) for ch in s) for s in strs]
+
+
+def hexbytes(values):
+    return 'bytes("' + "".join(f"{v:02X}" for v in values) + '")'
+
+
+def palette_literal(pal):
+    """[letters, colours as bytes]: four bytes little-endian per letter, at the letter's index times four -
+    a map slot per colour cost about fifty bytes of heap, this costs five."""
+    keys = "".join(pal.keys())
+    assert '"' not in keys and "\\" not in keys
+    # bytes.get reads signed: an opacity byte of 0x80 or more would come back negative; 60ths stay under 0x3C
+    assert all(v < 0x80000000 for v in pal.values()), "a palette value with its top bit set"
+    return f'["{keys}", ' + hexbytes(b for v in pal.values() for b in ((v >> (8 * i)) & 0xFF for i in range(4))) + "]"
+
+
+def entry(name, w, pal, strs, timing, own_palette):
+    """Berry lines defining `name` as a cast entry: frames (one string, a frame every w*8 characters), palette,
+    opacities per frame, width, timing (bytes, 10 ms units, or nil for one frame per pixel moved)."""
+    masked = [classes(s, w) for s in strs]
+    if timing is not None and any(d % 10 or d > 2550 for d in timing):
+        sys.exit(f"{name}: frame timings must be multiples of 10 ms up to 2550 ms, got {timing}")
+    return [f"# {name}: {w}x8, {len(strs)} frames",
+            f'var {name} = ["' + "".join(s for s, _ in masked) + '",',
+            (" " + palette_literal(own_palette) if own_palette is not None else " palette") + ",",
+            " [" + ", ".join(hexbytes(a) for _, a in masked) + "],",
+            f" {w}, " + ("nil" if timing is None else hexbytes(d // 10 for d in timing)) + "]"]
+
+
+def main():
+    # frames, palette, width; frame timing in ms (nil: one frame per pixel moved). The order is the header's.
+    # sonic: six of the GIF's twelve frames at their 100 ms, lemming: every other step at twice the time - half the heap
+    cast = {"mario": (mario(), None), "chase": (chase(), None), "invader": (invader(), [360, 360]),
+            "beam": (beam(), None), "yoshi": (yoshi(), [330] * 5), "sonic": gif_sprite("sonicrun.gif", take=[3, 4, 5, 6, 7, 8], dark=48, cut={(8, 44, 74), (0, 32, 57)}),
+            "lemming": gif_sprite("lemming.gif", take=[0, 2, 4, 6], stretch=True), "kitt": (kitt(), None),
+            "metroid": (metroid(), [300, 300])}
+    names = list(cast)
+    shared = {}
+    body = []
+    for name, ((w, pal, strs), timing) in cast.items():
+        if name in ("kitt", "beam"):
+            body += entry(name, w, pal, strs, timing, pal)
+        else:
+            body += entry(name, w, pal, relettered(pal, strs, shared), timing, None)
+    lines = ["# @module",
+             "# @desc The clock's wipe sprites: {\"cast\": name -> [frames as one string, palette, opacities per frame as bytes, "
+             "width, frame timing in 10 ms as bytes or nil], \"roster\": the names in the header's order}. A palette is [letters, colours as bytes, four little-endian per letter]; a letter is its colour "
+             "(0xAARRGGBB: translucent, AA its opacity in 60ths), a digit a transparent pixel's class and the byte "
+             "at that index of the frame's bytes its opacity in 60ths. Generated by sprites/extract, do not edit.",
+             "# the shared palette: every sprite but kitt and the beam draws from it",
+             "var palette = " + palette_literal({letter: colour for colour, letter in shared.items()})]
+    lines += body
+    lines.append("return {\"cast\": {" + ", ".join(f'"{n}": {n}' for n in names) + "}, \"roster\": [" + ", ".join(f'"{n}"' for n in names) + "]}")
+    module = "\n".join(lines) + "\n"
+    options = "options=random," + ",".join(names) + ",none"
+    for name, ((w, pal, strs), _) in cast.items():
+        print(f"{name:8} {w}x8, {len(strs)} frames")
+    print(f"shared palette: {len(shared)} colours; module {len(module.encode())} B")
+    if "--write" not in sys.argv:
+        print(module, end="")
+        return
+    src = SCRIPT.read_text()
+    src, n = re.subn(r"^(# @config to(?:Weather|Time) select .*?)options=\S+", lambda m: m.group(1) + options, src, flags=re.M)
+    if n != 2:
+        sys.exit(f"{SCRIPT}: expected the two toWeather/toTime lines, found {n}; nothing written")
+    SCRIPT.write_text(src)
+    MODULE.write_text(module)
+    print(f"updated {SCRIPT.relative_to(Path.cwd())} and {MODULE.relative_to(Path.cwd())}")
+
+main()

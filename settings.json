@@ -1,0 +1,18 @@
+{
+  "autoBrightness": true,
+  "autoTransition": true,
+  "appDurationMs": 7000,
+  "transitionDurationMs": 600,
+  "timeMode": 1,
+  "time24h": true,
+  "timeLeadingZero": true,
+  "timeSeparatorMode": "blink",
+  "dateOrder": "dayMonthYear",
+  "dateSeparator": "dot",
+  "dateYearMode": "twoDigit",
+  "weekdayBar": {
+    "show": false,
+    "startOnMonday": true
+  },
+  "uppercase": true
+}

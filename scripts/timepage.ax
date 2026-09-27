@@ -1,0 +1,95 @@
+# @module
+# @desc The clock's calendar card (9 px, the day) and its HH:MM, after the look of the built-in Time app and reading the same device settings. Muted design: card at 3 at the backdrop brightness, time at 15, colon steady; classic: card at 0, time at 12, colon as the device has it. Returns the class.
+import string
+
+class TimePage
+  # time strings, rebuilt only when the minute or the day changes
+  var c_min, c_day, hh, mm, dd, dx
+  # the built-in Time look, read from the device settings
+  var col_text, col_head, col_body, col_day, h24, lead0, sep, muted
+
+  def init()
+    self.reload()
+  end
+
+  # device settings, read on show and once a minute - never per frame
+  def reload()
+    self.c_min = -2
+    self.col_text = self.setting("timeColor", self.setting("textColor", 0xFFFFFF))
+    self.col_head = self.setting("calendarHeaderColor", 0xFF0000)
+    self.col_body = self.setting("calendarBodyColor", 0xFFFFFF)
+    self.col_day = self.setting("calendarTextColor", 0x000000)
+    self.h24 = self.setting("time24h", true)
+    self.lead0 = self.setting("timeLeadingZero", true)
+    self.sep = self.setting("timeSeparatorMode", "blink")
+    self.muted = store.get("design") == "muted"
+    if self.muted                        # the card as dim as the weather scene; the day as it is
+      var p = int(store.get("backdrop"))
+      self.col_head = self.shade(self.col_head, p)
+      self.col_body = self.shade(self.col_body, p)
+    end
+  end
+
+  def shade(c, p)
+    return ((((c >> 16) & 255) * p / 100) << 16) | ((((c >> 8) & 255) * p / 100) << 8) | ((c & 255) * p / 100)
+  end
+
+  def setting(key, fallback)
+    var v = settings.get(key)
+    return v == nil ? fallback : v
+  end
+
+  # t is a draw target (targets module): dot, rect, glyph. Muted: the card fills columns 3-11
+  # of the left block (0-13) and the time stands at 15-31 on every page; classic: card at 0-8,
+  # time at 12-28.
+  def calendar(t)
+    self.refresh()
+    var x = self.muted ? 3 : 0
+    t.rect(x, 0, 9, 2, self.col_head)
+    t.rect(x, 2, 9, 6, self.col_body)
+    var i = 0
+    while i < size(self.dd)
+      t.glyph(x + self.dx + 4 * i, self.dd[i], self.col_day, 7)
+      i += 1
+    end
+  end
+
+  # the colon blinks as the device's separator mode says - a second on, a second off - except in
+  # the muted design, where it stands
+  def clock(t)
+    self.refresh()
+    var x = self.muted ? 15 : 12
+    if self.hh[0] != " " t.glyph(x, self.hh[0], self.col_text, 7) end
+    t.glyph(x + 4, self.hh[1], self.col_text, 7)
+    if self.muted || self.sep != "blink" || epoch_ms() % 2000 < 1000
+      t.glyph(x + 8, ":", self.col_text, 7)
+    end
+    t.glyph(x + 10, self.mm[0], self.col_text, 7)
+    t.glyph(x + 14, self.mm[1], self.col_text, 7)
+  end
+
+  # draw() runs 40 times a second; the strings change with the minute, so build them then
+  def refresh()
+    var m = minute()
+    var d = day()
+    if m == self.c_min && d == self.c_day return end
+    self.c_min = m
+    self.c_day = d
+    self.dd = d > 0 ? str(d) : ""
+    self.dx = d > 9 ? 1 : 3
+    var h = hour()
+    if h < 0
+      self.hh = "--"
+      self.mm = "--"
+      return
+    end
+    if !self.h24
+      h = h % 12
+      if h == 0 h = 12 end
+    end
+    self.hh = (h < 10 ? (self.lead0 ? "0" : " ") : "") + str(h)
+    self.mm = string.format("%02d", m)
+  end
+end
+
+return TimePage

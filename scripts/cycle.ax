@@ -1,0 +1,199 @@
+# @module
+# @desc The clock's cycle: calendar, transition to the weather, weather, transition to the calendar - sprite wipes in the classic design, cross-fades in the muted one; which sprite carries each wipe (a setting's name, or a random draw that never repeats the last), how long each phase runs, and where the cycle stands; and the demo - every weather scene in turn on a hold of the middle button. Returns the class.
+import math
+
+class Cycle
+  # app draws: app.page(weather, t), app.wiper.reveal(who, to_weather, e, pace), app.full
+  var app, cast, names
+  # the cycle in ms: calendar (t_time), wipe to the weather, weather, wipe to the calendar (w_time). pick_* is
+  # the setting behind each wipe (a sprite's name, "random" or "none"), who_* the sprite
+  # carrying it this cycle, last the sprite of the latest wipe
+  var t0, t_time, w_weather, t_weather, w_time, total, pace, pick_weather, pick_time, who_weather, who_time, last, seeded, muted, fade
+  # the demo: scenes as bytes of [WMO code, day, C + 50], 5 s each; demo_t0 while one runs, demo_i
+  # its scene; held tells a hold of the middle button from a press
+  var scenes, demo_t0, demo_i, held
+
+  def init(app, cast, names)
+    self.app = app
+    self.cast = cast
+    self.names = names
+    self.t0 = nil
+    self.seeded = false
+    self.scenes = bytes("00014D00004002014502003B03013E2D013537013A3F013D4901265101425F014A")
+    self.demo_t0 = nil
+    self.reload()
+    self.plan()
+  end
+
+  # Settings are read here - on show and once a minute - never per frame.
+  def reload()
+    self.pace = int(store.get("pace"))
+    self.t_time = int(store.get("timeSecs")) * 1000
+    self.t_weather = int(store.get("weatherSecs")) * 1000
+    self.pick_weather = store.get("toWeather")
+    self.pick_time = store.get("toTime")
+    self.muted = store.get("design") == "muted"
+    self.fade = int(store.get("fade"))
+    self.demo_i = -1                  # a running demo puts its scene back at the next frame
+  end
+
+  # The coming cycle: its two sprites and, from their widths, its length. Called when the app
+  # is shown and whenever a cycle ends, never in between, so a running cycle keeps its timing.
+  def plan()
+    # seeded from the wall clock once the device has it; until then the draws follow Berry's
+    # fixed unseeded sequence, the same after every boot, each pick still uniform
+    if !self.seeded && epoch_ms() > 0
+      math.srand(int(epoch_ms() % 1000000000))
+      self.seeded = true
+    end
+    self.who_weather = self.choose(self.pick_weather)
+    self.who_time = self.choose(self.pick_time)
+    self.w_weather = self.muted ? self.fade : self.wipe_ms(self.who_weather)
+    self.w_time = self.muted ? self.fade : self.wipe_ms(self.who_time)
+    self.total = self.t_time + self.w_weather + self.t_weather + self.w_time
+  end
+
+  # The sprite a setting asks for; "random" - or a name the roster no longer has - is any of
+  # the roster except the previous wipe's, each equally likely.
+  def choose(pick)
+    if pick == "none" return pick end
+    var who = pick
+    if self.cast.find(pick) == nil
+      var r = self.names
+      var n = size(r)
+      var i = math.rand() % n
+      if r[i] == self.last i = (i + 1 + math.rand() % (n - 1)) % n end
+      who = r[i]
+    end
+    self.last = who
+    return who
+  end
+
+  # a sprite crosses the panel and leaves it: one pixel per pace; "none" is a hard cut
+  def wipe_ms(who)
+    if who == "none" return 0 end
+    return (32 + self.cast[who][3]) * self.pace + self.pace
+  end
+
+  def start()
+    self.t0 = now_ms()
+    self.reload()
+    self.plan()
+  end
+
+  # one frame: the demo's while one runs; else roll finished cycles over and draw the phase the
+  # cycle stands in
+  def draw()
+    var app = self.app
+    if self.demo_t0 != nil && self.demo_frame() return end
+    if self.t0 == nil self.t0 = now_ms() end
+    var e = now_ms() - self.t0
+    while e >= self.total
+      self.t0 += self.total
+      e -= self.total
+      self.plan()
+    end
+    if e < self.t_time
+      app.page(false, app.full)
+      return
+    end
+    e -= self.t_time
+    if e < self.w_weather
+      self.cross(self.who_weather, true, e)
+      return
+    end
+    e -= self.w_weather
+    if e < self.t_weather
+      app.page(true, app.full)
+      return
+    end
+    e -= self.t_weather
+    self.cross(self.who_time, false, e)
+  end
+
+  # one transition frame: the design's fade, or the sprite's wipe
+  def cross(who, to_weather, e)
+    if self.muted
+      self.app.wiper.fade(to_weather, e, self.fade)
+    else
+      self.app.wiper.reveal(who, to_weather, e, self.pace)
+    end
+  end
+
+  # "right" moves on to the next page, "left" back to the previous one, each brought in by its
+  # wipe; the cycle stands on a page from the first frame of that wipe. The two pages are each
+  # other's neighbours both ways, so the cycle wraps, and returns false when it did: the press
+  # went past the last page or before the first, where the firmware's own navigation may move
+  # on to another app if the rotation has one. While a demo runs the press is taken and nothing
+  # moves: the cycle's clock stands still meanwhile and would misjudge the edge.
+  def jump(btn)
+    if self.t0 == nil || self.demo_t0 != nil return true end
+    var e = now_ms() - self.t0
+    if e >= self.total e = self.total - 1 end
+    var wipe_w = self.t_time
+    var wipe_t = wipe_w + self.w_weather + self.t_weather
+    var on_weather = e >= wipe_w && e < wipe_t
+    self.t0 = now_ms() - (on_weather ? wipe_t : wipe_w)
+    return (btn == "right") != on_weather
+  end
+
+  # The middle button, taken at its press so the firmware's hold arrives: held 600 ms it starts
+  # the demo, or ends one; released before that it is the app's short press, the design switch.
+  # Other buttons are not taken here.
+  def button(btn, event)
+    if btn != "select" return false end
+    if event == "press"
+      self.held = false
+    elif event == "long"
+      self.held = true
+      if self.demo_t0 == nil self.demo_start() else self.demo_stop() end
+    elif event == "release" && !self.held
+      self.app.on_button("select")
+    end
+    return true
+  end
+
+  # the first scene from the next frame
+  def demo_start()
+    self.demo_t0 = now_ms()
+    self.demo_i = -1
+  end
+
+  # the live weather back from the store, where every fetch leaves it and where the weather module
+  # reads it at boot - so a fetch during the demo counts; then the cycle from its first page
+  def demo_stop()
+    var w = self.app.weather_page
+    w.traw = store.get("temp")
+    w.label = w.traw == nil ? nil : w.label_for(w.traw)
+    w.tcol = store.get("col", 0x666666)
+    w.code = store.get("code", -1)
+    w.isday = store.get("isday", true)
+    self.demo_t0 = nil
+    self.start()
+  end
+
+  # a demo frame, true when one was drawn: the scene the clock says, put on the weather page when
+  # it changes; the lap done, the demo ends and the cycle draws this frame
+  def demo_frame()
+    var i = (now_ms() - self.demo_t0) / 5000
+    var k = i * 3
+    if k >= size(self.scenes)
+      self.demo_stop()
+      return false
+    end
+    if i != self.demo_i
+      self.demo_i = i
+      var sc = self.scenes
+      var w = self.app.weather_page
+      var c = sc[k + 2] - 50
+      w.code = sc[k]
+      w.isday = sc[k + 1] == 1
+      w.tcol = w.colour(c)
+      w.label = w.label_for(c)
+    end
+    self.app.page(true, self.app.full)
+    return true
+  end
+end
+
+return Cycle

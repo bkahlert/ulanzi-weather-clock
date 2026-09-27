@@ -1,0 +1,151 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["pillow"]
+# ///
+"""Renders the preview GIFs in this directory from the scripts themselves.
+
+The clock runs in the standalone Berry the tests use (test/run builds it into
+~/.cache/awtrix-berry the first time), under the same stubbed script API, with a fixed time and
+a seeded weather; every frame's 32x8 pixels are drawn as squares with a one-pixel grid between them. Any change to the scripts can be
+previewed this way before it goes to the panel.
+
+    preview/render            # all previews
+    preview/render classic    # one of: muted, classic, scenes
+
+muted:   one loop of the muted design - calendar, cross-fade, weather, cross-fade
+classic: one loop of the classic design - calendar, Mario and Luigi wiping to the weather,
+         Blinky and Pac-Man wiping back
+scenes:  every weather scene for two seconds, on the classic design
+"""
+import json
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+from PIL import Image, ImageDraw
+
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent
+BERRY = Path.home() / ".cache/awtrix-berry/berry/berry"
+SCALE, GAP, STEP_MS = 10, 1, 50
+
+PROGRAM = r'''
+import targets
+import art
+FONT = art["font"]
+def hour() return 10 end
+def minute() return 32 end
+def day() return 24 end
+var wp = app.weather_page
+def weather(code, isday, temp)
+  wp.code = code
+  wp.isday = isday
+  wp.traw = temp
+  wp.label = wp.label_for(temp)
+  wp.tcol = wp.colour(temp)
+  wp.age = 0
+end
+def emit(name, ms, i)
+  print("FRAME " + name + "|" + str(ms) + "|" + str(i) + " " + str(FB))
+end
+# one cycle of a design, frame by frame; start() reads the settings and plans the cycle
+def loop(name, design, step)
+  _store["design"] = design
+  app.reload()
+  _now = 0
+  app.cycle.start()
+  var t = 0
+  var i = 0
+  while t < app.cycle.total
+    _now = t
+    fb_clear()
+    app.draw()
+    emit(name, step, i)
+    t += step
+    i += 1
+  end
+end
+var which = WHICH
+weather(2, true, 21)
+if which.find("muted") != nil
+  _store["timeSecs"] = 6
+  _store["weatherSecs"] = 6
+  _store["fade"] = 3000
+  loop("muted", "muted", STEP)
+end
+if which.find("classic") != nil
+  _store["timeSecs"] = 5
+  _store["weatherSecs"] = 5
+  _store["toWeather"] = "mario"
+  _store["toTime"] = "chase"
+  loop("classic", "classic", STEP)
+end
+if which.find("scenes") != nil
+  _store["design"] = "classic"
+  app.reload()
+  var sc = app.cycle.scenes
+  var k = 0
+  var i = 0
+  while k < size(sc)
+    weather(sc[k], sc[k + 1] == 1, sc[k + 2] - 50)
+    var t = 0
+    while t < 2000
+      _now = k * 1000 + t
+      fb_clear()
+      app.page(true, app.full)
+      emit("scenes", 100, i)
+      t += 100
+      i += 1
+    end
+    k += 3
+  end
+end
+'''
+
+
+def frames(which):
+    """Runs the clock under the harness and returns {name: (ms per frame, [frame pixels])}."""
+    if not BERRY.exists():
+        sys.exit(f"{BERRY} is missing; run test/run once to build the interpreter")
+    app = (ROOT / "scripts/clock.ax").read_text().rsplit("return Clock()", 1)[0] + "var app = Clock()\n"
+    program = PROGRAM.replace("WHICH", json.dumps(which)).replace("STEP", str(STEP_MS))
+    with tempfile.TemporaryDirectory() as tmp:
+        for m in ROOT.glob("scripts/*.ax"):
+            if m.stem != "clock":
+                shutil.copy(m, Path(tmp) / f"{m.stem}.be")
+        Path(tmp, "render.be").write_text((ROOT / "test/harness.be").read_text() + app + program)
+        run = subprocess.run([str(BERRY), "render.be"], cwd=tmp, capture_output=True, text=True)
+    if run.returncode:
+        sys.exit(run.stdout + run.stderr)
+    out = {}
+    for m in re.finditer(r"^FRAME (\w+)\|(\d+)\|\d+ (\[.*\])$", run.stdout, re.M):
+        out.setdefault(m.group(1), (int(m.group(2)), []))[1].append(json.loads(m.group(3)))
+    return out
+
+
+def frame_image(fb):
+    img = Image.new("RGB", (32 * SCALE, 8 * SCALE), (0, 0, 0))
+    d = ImageDraw.Draw(img)
+    for i, c in enumerate(fb):
+        x, y = (i % 32) * SCALE, (i // 32) * SCALE
+        col = (14, 14, 14) if c == 0 else ((c >> 16) & 255, (c >> 8) & 255, c & 255)
+        d.rectangle([x, y, x + SCALE - GAP - 1, y + SCALE - GAP - 1], fill=col)
+    return img
+
+
+def main(argv):
+    which = argv or ["muted", "classic", "scenes"]
+    for name, (ms, fbs) in frames(which).items():
+        imgs = [frame_image(fb).quantize(colors=255, dither=Image.Dither.NONE) for fb in fbs]
+        path = HERE / f"{name}.gif"
+        imgs[0].save(path, save_all=True, append_images=imgs[1:], duration=ms, loop=0, optimize=True)
+        print(f"{path.relative_to(ROOT)}: {len(imgs)} frames at {ms} ms, {path.stat().st_size // 1024} KB")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

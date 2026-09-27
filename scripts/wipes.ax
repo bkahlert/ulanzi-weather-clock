@@ -1,0 +1,135 @@
+# @module
+# @desc A transition frame of the clock. Classic: the sprite crosses the panel, the arriving page drawn left of it, the leaving page right of it, both cut pixel by pixel; inside the sprite's box each transparent pixel shows the page its cluster class names, a translucent pixel its colour blended over the arriving page. Muted: a cross-fade of the left block. Returns the class.
+import string
+import art
+import targets
+
+class Wipes
+  # app draws the pages (app.page(weather, target)); cast maps a sprite's name to [frames as one
+  # string, palette as [letters, colours as bytes], opacities per frame, width, frame timing in
+  # 10 ms as bytes or nil]
+  var app, cast, left, right, nb, ob
+
+  def init(app, cast, widest)
+    self.app = app
+    self.cast = cast
+    self.left = targets["Direct"](0, 0)
+    self.right = targets["Direct"](32, 32)
+    self.nb = targets["Buffer"](art["font"], widest)
+    self.ob = targets["Buffer"](art["font"], widest)
+  end
+
+  # e ms into the wipe, one pixel per pace ms: the sprite's left edge is e / pace pixels past
+  # the left border. Left of the sprite the firmware draws the arriving page, right of it the
+  # leaving page. Inside the sprite's box the script draws both pages itself and picks per
+  # pixel: the sprite where it is opaque; its colour over the arriving page where it is
+  # translucent (a palette value 0xAARRGGBB, AA the opacity in 60ths); else the page the
+  # pixel's class names - arriving in the gaps at the left edge, leaving in those at the right
+  # edge, arriving dimmed in between.
+  def reveal(who, to_weather, e, pace)
+    var sp = self.cast[who]
+    var keys = sp[1][0]
+    var cols = sp[1][1]
+    var w = sp[3]
+    var n = w * 8
+    var step = e / pace
+    var x = step - w
+    var s = sp[0]
+    var f = self.frame_at(size(s) / n, sp[4], step, e)
+    var base = f * n
+    var alpha = sp[2][f]
+    self.left.x1 = x
+    self.right.x0 = x + w
+    self.app.page(to_weather, self.left)
+    self.app.page(!to_weather, self.right)
+    self.nb.reset(x, w)
+    self.app.page(to_weather, self.nb)
+    self.ob.reset(x, w)
+    self.app.page(!to_weather, self.ob)
+    var nb = self.nb
+    var ob = self.ob
+    var i = 0
+    while i < n
+      var xx = x + i % w
+      if xx >= 0 && xx < 32
+        var ch = s[base + i]
+        var j = string.find(keys, ch)
+        var c
+        if j < 0
+          var a = alpha[string.byte(ch) - 48]
+          if a == 0
+            c = ob.at(i)
+          elif a == 60
+            c = nb.at(i)
+          else
+            c = self.dim(nb.at(i), a)
+          end
+        else
+          c = cols.get(j * 4, 4)
+          if c > 0xFFFFFF c = self.blend(c & 0xFFFFFF, nb.at(i), c >> 24) end
+        end
+        self.app.full.dot(xx, i / w, c)
+      end
+      i += 1
+    end
+  end
+
+  # the frame to show: one per pixel moved, or by the sprite's own timing (bytes, 10 ms each)
+  # The muted design's transition: the left block, columns 0-15, cross-faded e ms into a fade
+  # of ms, the arriving page over the leaving one; right of it the arriving page is drawn as it
+  # is - the time, the same on both pages, and the stale dot. The two sprite buffers hold the
+  # pages meanwhile.
+  def fade(to_weather, e, ms)
+    # linear: one 60th every ms / 60 - 50 ms, two frames, at the default 3 s. An eased curve
+    # sat on one level for 300 ms at its ends, which showed as steps at this brightness.
+    var a = e * 60 / ms
+    if a > 60 a = 60 end
+    var nb = self.nb
+    var ob = self.ob
+    nb.reset(0, 16)
+    self.app.page(to_weather, nb)
+    ob.reset(0, 16)
+    self.app.page(!to_weather, ob)
+    # the right part first: a glyph starting at column 15 spills into the block (the time's
+    # first digit does), and the blend drawn after it owns columns 0-15
+    self.right.x0 = 16
+    self.app.page(to_weather, self.right)
+    var full = self.app.full
+    var i = 0
+    while i < 128
+      full.dot(i % 16, i / 16, self.blend(nb.at(i), ob.at(i), a))
+      i += 1
+    end
+  end
+
+  def frame_at(count, t, step, e)
+    if t == nil return step % count end
+    var total = 0
+    var i = 0
+    while i < count
+      total += t[i]
+      i += 1
+    end
+    var r = (e / 10) % total
+    i = 0
+    while r >= t[i]
+      r -= t[i]
+      i += 1
+    end
+    return i
+  end
+
+  def dim(c, a)
+    return ((((c >> 16) & 255) * a / 60) << 16) | ((((c >> 8) & 255) * a / 60) << 8) | ((c & 255) * a / 60)
+  end
+
+  # c at a/60 over p
+  def blend(c, p, a)
+    var b = 60 - a
+    return (((((c >> 16) & 255) * a + ((p >> 16) & 255) * b) / 60) << 16)
+         | (((((c >> 8) & 255) * a + ((p >> 8) & 255) * b) / 60) << 8)
+         | (((c & 255) * a + (p & 255) * b) / 60)
+  end
+end
+
+return Wipes

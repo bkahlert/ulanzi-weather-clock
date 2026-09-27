@@ -1,0 +1,87 @@
+# @module
+# @desc Where the clock's pages draw: Direct, the panel through the firmware clipped to a column range; Buffer, the script's own pixels inside a sprite's box. Returns {"Direct": class, "Buffer": class}.
+
+# The panel through the firmware, clipped to columns x0..x1-1, every colour scaled to gain %
+# (the muted design draws at half). A glyph is drawn when it may overlap the range; it is at
+# most 3 px wide, so it can spill 2 px past an edge, and inside a sprite's box every pixel is
+# overwritten anyway.
+class Direct
+  var x0, x1, gain
+  def init(x0, x1)
+    self.x0 = x0
+    self.x1 = x1
+    self.gain = 100
+  end
+  def scale(c)
+    var g = self.gain
+    if g == 100 return c end
+    return rgb(((c >> 16) & 255) * g / 100, ((c >> 8) & 255) * g / 100, (c & 255) * g / 100)
+  end
+  def dot(x, y, c)
+    if x >= self.x0 && x < self.x1 pixel(x, y, self.scale(c)) end
+  end
+  def rect(x, y, w, h, c)
+    var a = x > self.x0 ? x : self.x0
+    var b = x + w < self.x1 ? x + w : self.x1
+    if b > a rect_fill(a, y, b - a, h, self.scale(c)) end
+  end
+  # base is the row under the glyph: 7 puts the 5-row glyphs on rows 2-6, where the built-in
+  # Time app has them, 5 on rows 0-4
+  def glyph(x, ch, c, base)
+    if x < self.x1 && x + 3 > self.x0 text(x, base, ch, self.scale(c)) end
+  end
+end
+
+# The script's own pixels inside a sprite's box, glyphs from the font the art generator copied
+# from the firmware, so the compositor can pick them one by one. Sized once for the widest sprite.
+class Buffer
+  var x0, w, px, font
+  def init(font, widest)
+    self.font = font
+    self.px = bytes(widest * 32)
+  end
+  def reset(x0, w)
+    self.x0 = x0
+    self.w = w
+    self.px.clear()
+    self.px.resize(w * 32)
+  end
+  def dot(x, y, c)
+    var k = x - self.x0
+    if k >= 0 && k < self.w self.px.set((y * self.w + k) * 4, c, 4) end
+  end
+  def at(i)
+    return self.px.get(i * 4, 4)
+  end
+  def rect(x, y, w, h, c)
+    var yy = y
+    while yy < y + h
+      var xx = x
+      while xx < x + w
+        self.dot(xx, yy, c)
+        xx += 1
+      end
+      yy += 1
+    end
+  end
+  # a glyph is [width, rows above the baseline, rows top to bottom joined with "|"]
+  def glyph(x, ch, c, base)
+    var g = self.font.find(ch)
+    if g == nil return end
+    var w = g[0]
+    var rows = g[2]
+    var h = (size(rows) + 1) / (w + 1)
+    var top = base - g[1] - h
+    var r = 0
+    while r < h
+      var k = 0
+      while k < w
+        if rows[r * (w + 1) + k] == "#" self.dot(x + k, top + r, c) end
+        k += 1
+      end
+      r += 1
+    end
+  end
+end
+
+return {"Direct": Direct, "Buffer": Buffer}
