@@ -4,6 +4,7 @@ A clock for the [Ulanzi TC001](https://www.ulanzi.com/products/ulanzi-pixel-smar
 
 [![License](https://img.shields.io/github/license/bkahlert/ulanzi-weather-clock?color=29ABE2&label=License)](LICENSE)
 [![AWTRIX NG](https://img.shields.io/badge/AWTRIX%20NG-1.1.2%2B-2E7D32)](https://github.com/Blueforcer/awtrix-ng)
+[![AWTRIX Hub](https://img.shields.io/badge/AWTRIX%20Hub-flow-F4A261)](https://awtrix.de/flow/wQPSUfXDCHbe)
 [![Buy Me A Coffee](https://img.shields.io/static/v1?label=&message=%E2%98%95%20Buy%20Me%20A%20Coffee&color=FFDD00)](https://www.buymeacoffee.com/bkahlert)
 
 ---
@@ -33,6 +34,8 @@ A clock for the [Ulanzi TC001](https://www.ulanzi.com/products/ulanzi-pixel-smar
 | Tools | Python 3.11+ for `apply` and `bundle`; [uv](https://docs.astral.sh/uv/) for the generators and the previews |
 
 ## Installation
+
+The clock is listed [on the AWTRIX Hub](https://awtrix.de/flow/wQPSUfXDCHbe), but a Hub flow is one script and the clock is eight: *Send to AWTRIX* installs the app alone and the panel shows `ERR:`. Install it from the bundle or with the installer instead.
 
 ### From the bundle
 

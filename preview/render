@@ -11,12 +11,13 @@ a seeded weather; every frame's 32x8 pixels are drawn as squares with a one-pixe
 previewed this way before it goes to the panel.
 
     preview/render            # all previews
-    preview/render classic    # one of: muted, classic, scenes
+    preview/render classic    # one of: muted, classic, scenes, hub
 
 muted:   one loop of the muted design - calendar, cross-fade, weather, cross-fade
 classic: one loop of the classic design - calendar, Mario and Luigi wiping to the weather,
          Blinky and Pac-Man wiping back
 scenes:  every weather scene for two seconds, on the classic design
+hub:     the muted loop cut to nine seconds, the cover on awtrix.de takes ten at most
 """
 import json
 import re
@@ -32,6 +33,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 BERRY = Path.home() / ".cache/awtrix-berry/berry/berry"
 SCALE, GAP, STEP_MS = 10, 1, 50
+HUB_MS = 9000
 
 PROGRAM = r'''
 import targets
@@ -138,8 +140,13 @@ def frame_image(fb):
 
 
 def main(argv):
-    which = argv or ["muted", "classic", "scenes"]
-    for name, (ms, fbs) in frames(which).items():
+    which = argv or ["muted", "classic", "scenes", "hub"]
+    rendered = frames(sorted(set(which) - {"hub"} | ({"muted"} if "hub" in which else set())))
+    if "hub" in which:
+        ms, fbs = rendered["muted"]
+        rendered["hub"] = (ms, fbs[: HUB_MS // ms])
+    for name in which:
+        ms, fbs = rendered[name]
         imgs = [frame_image(fb).quantize(colors=255, dither=Image.Dither.NONE) for fb in fbs]
         path = HERE / f"{name}.gif"
         imgs[0].save(path, save_all=True, append_images=imgs[1:], duration=ms, loop=0, optimize=True)
