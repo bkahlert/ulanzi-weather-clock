@@ -4,6 +4,7 @@ A clock for the [Ulanzi TC001](https://www.ulanzi.com/products/ulanzi-pixel-smar
 
 [![License](https://img.shields.io/github/license/bkahlert/ulanzi-weather-clock?color=29ABE2&label=License)](LICENSE)
 [![AWTRIX NG](https://img.shields.io/badge/AWTRIX%20NG-1.1.2%2B-2E7D32)](https://github.com/Blueforcer/awtrix-ng)
+[![Buy Me A Coffee](https://img.shields.io/static/v1?label=&message=%E2%98%95%20Buy%20Me%20A%20Coffee&color=FFDD00)](https://www.buymeacoffee.com/bkahlert)
 
 ---
 
