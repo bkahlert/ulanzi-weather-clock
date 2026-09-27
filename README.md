@@ -92,7 +92,7 @@ sprites/extract --write    # wipe sprites → scripts/sprites.ax
 ./bundle                   # dist/ulanzi-weather-clock-<version>.zip
 ```
 
-The clock is one app, [`clock.ax`](scripts/clock.ax), and seven modules it imports. Why it is built that way, how the wipes and the scenes work: [docs/design.md](docs/design.md). The panel's memory rules that shaped it: [docs/memory.md](docs/memory.md). Flashing, firmware upgrades and the tripwires met along the way: [docs/operations.md](docs/operations.md). Also in the box: [`departures.ax`](scripts/departures.ax), a departures board for Berlin's BVG, switched off by default.
+The clock is one app, [`clock.ax`](scripts/clock.ax), and seven modules it imports. Why it is built that way, how the wipes and the scenes work: [docs/design.md](docs/design.md). The panel's memory rules that shaped it: [docs/memory.md](docs/memory.md). Flashing, firmware upgrades and the tripwires met along the way: [docs/operations.md](docs/operations.md). The flow on awtrix.de and its text: [docs/hub.md](docs/hub.md). Also in the box: [`departures.ax`](scripts/departures.ax), a departures board for Berlin's BVG, switched off by default.
 
 ## Credits
 

@@ -33,6 +33,10 @@
 # block and recompiles this app on every settings save, with a 24 KB reserve it will not touch
 # while doing so; a warm clock has been seen with 9 KB in one piece and 30 KB free. This file
 # is the settings and the wiring, and it is kept as small as it can be.
+#
+# Part of github.com/bkahlert/ulanzi-weather-clock, which holds the modules this file imports.
+# On its own - installed from the AWTRIX Hub, say - it shows ERR until they are there; the
+# release bundle installs all eight scripts at once (web UI: System, Restore backup).
 import targets
 import timepage
 import weather
